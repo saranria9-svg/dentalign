@@ -22,10 +22,10 @@ import { buildPairwiseEdges } from "./edges";
 import { binaryGraphCut } from "./graphcut";
 import { upsampleLabelsToFullRes } from "./upsample";
 import { computeToothnessPrior } from "./geometricPrior";
-import { calibrateGumProfile, classifyByGumProfile, type GumProfile } from "./gumProfile";
+import { calibrateGumProfile, classifyByGumProfile, type ReferenceProfile } from "./gumProfile";
 
 export type Jaw = "upper" | "lower";
-export type { GumProfile } from "./gumProfile";
+export type { ReferenceProfile } from "./gumProfile";
 
 const NUM_CLASSES = 15;
 const TARGET_CELLS = 10000;
@@ -88,7 +88,7 @@ export interface ReferenceSegmentResult {
   /** Full-resolution tooth(1)/gingiva(0) labels for the reference stage. */
   labels: Uint8Array;
   /** Boundary learned from this stage, reusable on every other stage. */
-  profile: GumProfile;
+  profile: ReferenceProfile;
 }
 
 // Decimation, feature/adjacency building, graph-cut and upsampling below
@@ -190,18 +190,42 @@ async function segmentReferenceStageImpl(
 }
 
 /**
- * Classifies every other stage's full-resolution mesh by re-applying the
- * profile learned from the reference stage — no ONNX inference, no
- * decimation, no graph-cut, just a per-cell height check, so it's cheap
- * enough to run on every stage at import time and keeps the exact same
- * boundary criterion (hence the same visual boundary) everywhere.
+ * Classifies every other stage's mesh by re-applying the profile learned
+ * from the reference stage — no ONNX inference, no graph-cut, so it's
+ * cheap enough to run on every stage at import time while still tracking
+ * the reference's real (not just averaged) boundary shape.
+ *
+ * The K-NN vote runs against the *decimated* mesh (same ~10,000-cell scale
+ * as the reference profile itself), then propagates to full resolution via
+ * the same majority-vote upsampling the reference stage's own pipeline
+ * uses. Voting per full-resolution cell directly (~150k+ independent
+ * queries) looked speckled — each cell's own nearest neighbours can flip
+ * independently of its physical neighbours with no spatial smoothing,
+ * unlike the graph-cut's pairwise terms. Classifying only the decimated
+ * cells and upsampling gives each small patch of full-resolution triangles
+ * the same label as their shared decimated cell, which is what actually
+ * reads as a clean, solid boundary instead of noise.
  */
 export function classifyStageWithProfile(
   fullGeometry: THREE.BufferGeometry,
-  profile: GumProfile
+  profile: ReferenceProfile
 ): Uint8Array {
-  const { bx, by, bz } = fullResCellBarycenters(fullGeometry);
-  return classifyByGumProfile(bx, by, bz, profile);
+  const decGeometry = decimateToTargetCells(fullGeometry, TARGET_CELLS);
+  const decPos = decGeometry.attributes.position;
+  const nDec = decPos.count / 3;
+  const dbx = new Float64Array(nDec);
+  const dby = new Float64Array(nDec);
+  const dbz = new Float64Array(nDec);
+  for (let t = 0; t < nDec; t++) {
+    const i0 = t * 3, i1 = i0 + 1, i2 = i0 + 2;
+    dbx[t] = (decPos.getX(i0) + decPos.getX(i1) + decPos.getX(i2)) / 3;
+    dby[t] = (decPos.getY(i0) + decPos.getY(i1) + decPos.getY(i2)) / 3;
+    dbz[t] = (decPos.getZ(i0) + decPos.getZ(i1) + decPos.getZ(i2)) / 3;
+  }
+  const decLabels = classifyByGumProfile(dbx, dby, dbz, profile);
+
+  const { bx: fbx, by: fby, bz: fbz } = fullResCellBarycenters(fullGeometry);
+  return upsampleLabelsToFullRes(dbx, dby, dbz, decLabels, fbx, fby, fbz, 3);
 }
 
 function fullResCellBarycenters(fullGeometry: THREE.BufferGeometry) {
