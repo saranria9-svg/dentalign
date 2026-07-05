@@ -76,11 +76,40 @@ export interface SegmentProgress {
   stage: "decimating" | "preprocessing" | "inferring" | "refining" | "upsampling" | "done";
 }
 
+// Decimation, feature/adjacency building, graph-cut and upsampling below
+// are plain synchronous JS on the main thread (only the ONNX `session.run`
+// call actually benefits from being async/threaded). Multiple stages can
+// each request a segmentation in quick succession — e.g. flipping through
+// Subsetup stages during autoplay faster than a single ~10s segmentation
+// finishes — and letting those run "concurrently" just interleaves their
+// synchronous chunks on the same thread, starving the UI (autoplay's stage
+// timer included) without actually finishing any of them sooner. A simple
+// FIFO queue serializes the heavy work: still fully async/non-blocking for
+// callers, just one stage's segmentation actually runs at a time.
+let queue: Promise<void> = Promise.resolve();
+
+function runQueued<T>(task: () => Promise<T>): Promise<T> {
+  const result = queue.then(task, task);
+  queue = result.then(
+    () => undefined,
+    () => undefined
+  );
+  return result;
+}
+
 /**
  * Segments a full-resolution jaw mesh into tooth (1) / gingiva (0) labels
  * per cell, aligned with `fullGeometry`'s (non-indexed) triangle order.
  */
-export async function segmentToothGum(
+export function segmentToothGum(
+  fullGeometry: THREE.BufferGeometry,
+  jaw: Jaw,
+  onProgress?: (p: SegmentProgress) => void
+): Promise<Uint8Array> {
+  return runQueued(() => segmentToothGumImpl(fullGeometry, jaw, onProgress));
+}
+
+async function segmentToothGumImpl(
   fullGeometry: THREE.BufferGeometry,
   jaw: Jaw,
   onProgress?: (p: SegmentProgress) => void

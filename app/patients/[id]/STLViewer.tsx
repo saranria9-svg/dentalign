@@ -11,9 +11,17 @@ import { segmentToothGum, type Jaw } from "./meshsegnet/segment";
 
 export type ArchVisibility = "both" | "upper" | "lower";
 
-interface Viewer3DProps {
+// One treatment stage's raw STL buffers (a 3Shape "SubsetupN" folder, the
+// initial scan, or — for imports with no staging at all — the single
+// scan wrapped as a one-element list by the caller).
+export interface ScanStageInput {
+  label: string;
   upperBuffer: ArrayBuffer | null;
   lowerBuffer: ArrayBuffer | null;
+}
+
+interface Viewer3DProps {
+  stages: ScanStageInput[];
 }
 
 type MlStatus = "idle" | "running" | "done" | "unavailable";
@@ -44,24 +52,30 @@ function setToothGumColors(
   geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
 }
 
-function useStlGeometry(
-  buffer: ArrayBuffer | null,
+// Per-stage, per-jaw geometry cache. Each stage's STL is only ever parsed
+// and segmented once: switching stages (manually, via autoplay, or during
+// video export) reuses whatever's already in the cache instead of
+// reprocessing, and a segmentation that finishes after the user has moved
+// on to another stage still lands in its own cache entry — so coming back
+// later shows the AI-refined result immediately rather than redoing it.
+function useStageGeometry(
+  stages: ScanStageInput[],
+  stageIndex: number,
   jaw: Jaw,
   toothColor: string,
   gumColor: string
 ): GeometryState {
-  const [state, setState] = useState<GeometryState>({
-    geometry: null,
-    error: null,
-    mlStatus: "idle",
-  });
+  const [cache, setCache] = useState<Map<string, GeometryState>>(() => new Map());
+  const startedRef = useRef<Set<string>>(new Set());
+  const key = `${jaw}-${stageIndex}`;
+  const stage = stages[stageIndex];
+  const buffer = stage ? (jaw === "upper" ? stage.upperBuffer : stage.lowerBuffer) : null;
 
   useEffect(() => {
-    if (!buffer) {
-      setState({ geometry: null, error: null, mlStatus: "idle" });
-      return;
-    }
-    let cancelled = false;
+    if (!buffer) return;
+    if (startedRef.current.has(key)) return; // already processed or in flight
+    startedRef.current.add(key);
+
     try {
       const loader = new STLLoader();
       // Copy the buffer: STLLoader.parse reads it as-is and we don't want
@@ -78,39 +92,37 @@ function useStlGeometry(
       // estimate, then refine it in the background with the MeshSegNet ONNX
       // model (real tooth/gingiva segmentation, ~10s client-side) once it's
       // ready — the procedural pass means the viewer never sits blank while
-      // that runs.
+      // that runs, and works just as well when flipping through stages.
       if (!geometry.hasColors) {
         applyProceduralDentalColors(geometry, { toothColor, gumColor });
-        setState({ geometry, error: null, mlStatus: "running" });
+        setCache((prev) => new Map(prev).set(key, { geometry, error: null, mlStatus: "running" }));
 
         segmentToothGum(geometry, jaw)
           .then((labels) => {
-            if (cancelled) return;
             setToothGumColors(geometry, labels, toothColor, gumColor);
             geometry.attributes.color.needsUpdate = true;
-            setState({ geometry, error: null, mlStatus: "done" });
+            setCache((prev) => new Map(prev).set(key, { geometry, error: null, mlStatus: "done" }));
           })
           .catch((mlError) => {
             console.error("Segmentation MeshSegNet indisponible :", mlError);
-            if (!cancelled) setState({ geometry, error: null, mlStatus: "unavailable" });
+            setCache((prev) => new Map(prev).set(key, { geometry, error: null, mlStatus: "unavailable" }));
           });
       } else {
-        setState({ geometry, error: null, mlStatus: "unavailable" });
+        setCache((prev) => new Map(prev).set(key, { geometry, error: null, mlStatus: "unavailable" }));
       }
     } catch (error) {
       console.error("Erreur de lecture du fichier STL :", error);
-      setState({
-        geometry: null,
-        error: "Impossible de lire ce fichier STL.",
-        mlStatus: "idle",
-      });
+      setCache((prev) =>
+        new Map(prev).set(key, {
+          geometry: null,
+          error: "Impossible de lire ce fichier STL.",
+          mlStatus: "idle",
+        })
+      );
     }
-    return () => {
-      cancelled = true;
-    };
-  }, [buffer, jaw, toothColor, gumColor]);
+  }, [key, buffer, jaw, toothColor, gumColor]);
 
-  return state;
+  return cache.get(key) ?? { geometry: null, error: null, mlStatus: buffer ? "running" : "idle" };
 }
 
 // Enamel-like material: low metalness, a soft clearcoat for the moist/glossy
@@ -126,9 +138,10 @@ function JawMesh({
   fallbackColor: string;
 }) {
   // Vertex colors carry the tooth/gum split (either real scan color or the
-  // procedural ivory/gum estimate computed in useStlGeometry). The material
-  // color is left white so it doesn't tint them; fallbackColor only kicks
-  // in for the unexpected case where no color attribute made it through.
+  // procedural ivory/gum estimate computed in useStageGeometry). The
+  // material color is left white so it doesn't tint them; fallbackColor
+  // only kicks in for the unexpected case where no color attribute made it
+  // through.
   const hasVertexColors = geometry.hasAttribute("color");
   return (
     <mesh geometry={geometry} rotation={[-Math.PI / 2, 0, 0]} castShadow receiveShadow>
@@ -161,9 +174,20 @@ const LOWER_TOOTH_COLOR = "#f1e6cf";
 const UPPER_GUM_COLOR = "#e3a39a";
 const LOWER_GUM_COLOR = "#e0958b";
 
-export default function STLViewer({ upperBuffer, lowerBuffer }: Viewer3DProps) {
-  const upper = useStlGeometry(upperBuffer, "upper", UPPER_TOOTH_COLOR, UPPER_GUM_COLOR);
-  const lower = useStlGeometry(lowerBuffer, "lower", LOWER_TOOTH_COLOR, LOWER_GUM_COLOR);
+const STAGE_HOLD_MS = 1200;
+
+export default function STLViewer({ stages }: Viewer3DProps) {
+  const [stageIndex, setStageIndex] = useState(0);
+  const [autoPlaying, setAutoPlaying] = useState(false);
+
+  // Clamp when a new scan with fewer stages gets imported.
+  useEffect(() => {
+    setStageIndex((i) => Math.min(i, Math.max(0, stages.length - 1)));
+  }, [stages.length]);
+
+  const currentStage = stages[stageIndex] as ScanStageInput | undefined;
+  const upper = useStageGeometry(stages, stageIndex, "upper", UPPER_TOOTH_COLOR, UPPER_GUM_COLOR);
+  const lower = useStageGeometry(stages, stageIndex, "lower", LOWER_TOOTH_COLOR, LOWER_GUM_COLOR);
 
   const [visibility, setVisibility] = useState<ArchVisibility>("both");
   const [autoRotate, setAutoRotate] = useState(false);
@@ -177,6 +201,7 @@ export default function STLViewer({ upperBuffer, lowerBuffer }: Viewer3DProps) {
   const hasLower = lower.geometry !== null;
   const hasAny = hasUpper || hasLower;
   const mlRunning = upper.mlStatus === "running" || lower.mlStatus === "running";
+  const hasMultipleStages = stages.length > 1;
 
   useEffect(() => {
     return () => {
@@ -184,11 +209,55 @@ export default function STLViewer({ upperBuffer, lowerBuffer }: Viewer3DProps) {
     };
   }, [videoUrl]);
 
+  // Auto-play: step through stages on a timer until the last one, then stop.
+  useEffect(() => {
+    if (!autoPlaying) return;
+    const interval = setInterval(() => {
+      setStageIndex((i) => {
+        if (i >= stages.length - 1) {
+          setAutoPlaying(false);
+          return i;
+        }
+        return i + 1;
+      });
+    }, STAGE_HOLD_MS);
+    return () => clearInterval(interval);
+  }, [autoPlaying, stages.length]);
+
   function resetView() {
     controlsRef.current?.reset();
   }
 
+  function goToPreviousStage() {
+    setStageIndex((i) => Math.max(0, i - 1));
+  }
+
+  function goToNextStage() {
+    setStageIndex((i) => Math.min(stages.length - 1, i + 1));
+  }
+
+  function toggleAutoPlay() {
+    setAutoPlaying((wasPlaying) => {
+      // Replaying from a finished sequence should restart from the beginning
+      // rather than immediately stop again at the last stage.
+      if (!wasPlaying && stageIndex === stages.length - 1) {
+        setStageIndex(0);
+      }
+      return !wasPlaying;
+    });
+  }
+
   function createVideo() {
+    setAutoPlaying(false);
+    if (hasMultipleStages) {
+      createStagesVideo();
+    } else {
+      createSingleStageVideo();
+    }
+  }
+
+  // Original behaviour, unchanged: 8s of camera rotation on the one model.
+  function createSingleStageVideo() {
     const canvas = canvasContainerRef.current?.querySelector("canvas");
     if (!canvas) {
       setVideoError("Le rendu 3D n'est pas encore prêt.");
@@ -218,6 +287,51 @@ export default function STLViewer({ upperBuffer, lowerBuffer }: Viewer3DProps) {
     recorder.start();
 
     setTimeout(() => recorder.stop(), 8000);
+  }
+
+  // Records the whole treatment evolution: restarts from stage 1, keeps the
+  // camera rotating continuously, and advances one stage every
+  // STAGE_HOLD_MS until the last one, using whichever geometry (AI-refined
+  // or still-procedural) is already cached for each stage at the moment it
+  // appears on screen — never blocking on segmentation.
+  function createStagesVideo() {
+    const canvas = canvasContainerRef.current?.querySelector("canvas");
+    if (!canvas) {
+      setVideoError("Le rendu 3D n'est pas encore prêt.");
+      return;
+    }
+
+    setVideoError(null);
+    const stream = canvas.captureStream(30);
+    const recorder = new MediaRecorder(stream, { mimeType: "video/webm" });
+    const chunks: Blob[] = [];
+
+    recorder.ondataavailable = (event) => {
+      if (event.data.size > 0) chunks.push(event.data);
+    };
+
+    recorder.onstop = () => {
+      const blob = new Blob(chunks, { type: "video/webm" });
+      setVideoUrl(URL.createObjectURL(blob));
+      setRecording(false);
+    };
+
+    setRecording(true);
+    setAutoRotate(true);
+    setStageIndex(0);
+    recorder.start();
+
+    let index = 0;
+    const advance = () => {
+      index += 1;
+      if (index >= stages.length) {
+        recorder.stop();
+        return;
+      }
+      setStageIndex(index);
+      setTimeout(advance, STAGE_HOLD_MS);
+    };
+    setTimeout(advance, STAGE_HOLD_MS);
   }
 
   return (
@@ -283,6 +397,44 @@ export default function STLViewer({ upperBuffer, lowerBuffer }: Viewer3DProps) {
           </button>
         </div>
       </div>
+
+      {hasMultipleStages && (
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 bg-slate-50/60 px-4 py-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={goToPreviousStage}
+              disabled={stageIndex === 0 || autoPlaying || recording}
+              className="rounded-full bg-white px-3 py-1.5 text-sm font-medium text-slate-600 shadow-sm ring-1 ring-slate-200 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              ← Précédent
+            </button>
+            <span className="rounded-full bg-white px-3 py-1.5 text-sm font-medium text-slate-700 shadow-sm ring-1 ring-slate-200">
+              {currentStage?.label ?? "—"} · {stageIndex + 1}/{stages.length}
+            </span>
+            <button
+              type="button"
+              onClick={goToNextStage}
+              disabled={stageIndex === stages.length - 1 || autoPlaying || recording}
+              className="rounded-full bg-white px-3 py-1.5 text-sm font-medium text-slate-600 shadow-sm ring-1 ring-slate-200 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Suivant →
+            </button>
+          </div>
+          <button
+            type="button"
+            onClick={toggleAutoPlay}
+            disabled={recording}
+            className={`rounded-full px-3 py-1.5 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-40 ${
+              autoPlaying
+                ? "bg-blue-600 text-white"
+                : "bg-white text-slate-600 shadow-sm ring-1 ring-slate-200 hover:bg-slate-100"
+            }`}
+          >
+            {autoPlaying ? "⏸ Pause" : "▶ Lecture automatique"}
+          </button>
+        </div>
+      )}
 
       <div ref={canvasContainerRef} className="h-[520px] w-full bg-slate-50">
         {hasAny ? (
