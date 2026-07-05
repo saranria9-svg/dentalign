@@ -58,6 +58,16 @@ function setToothGumColors(
 // reprocessing, and a segmentation that finishes after the user has moved
 // on to another stage still lands in its own cache entry — so coming back
 // later shows the AI-refined result immediately rather than redoing it.
+//
+// The STL parse + procedural coloring happen synchronously during render
+// (memoized into `cacheRef`, keyed by stage+jaw, so each buffer is only
+// ever parsed once) rather than inside a useEffect. Doing it in an effect
+// meant that on every stage switch there was a render where the new key
+// wasn't in the cache yet — `geometry` was briefly null, `hasAny` false,
+// and the whole model (or even the whole Canvas, since it's only mounted
+// when `hasAny`) flashed away to the "Aucun modèle 3D importé" placeholder
+// before the effect caught up a moment later. Only the actual MeshSegNet
+// segmentation (genuinely async, ~10s) stays in an effect.
 function useStageGeometry(
   stages: ScanStageInput[],
   stageIndex: number,
@@ -65,17 +75,14 @@ function useStageGeometry(
   toothColor: string,
   gumColor: string
 ): GeometryState {
-  const [cache, setCache] = useState<Map<string, GeometryState>>(() => new Map());
+  const cacheRef = useRef<Map<string, GeometryState>>(new Map());
   const startedRef = useRef<Set<string>>(new Set());
+  const [, setTick] = useState(0);
   const key = `${jaw}-${stageIndex}`;
   const stage = stages[stageIndex];
   const buffer = stage ? (jaw === "upper" ? stage.upperBuffer : stage.lowerBuffer) : null;
 
-  useEffect(() => {
-    if (!buffer) return;
-    if (startedRef.current.has(key)) return; // already processed or in flight
-    startedRef.current.add(key);
-
+  if (buffer && !cacheRef.current.has(key)) {
     try {
       const loader = new STLLoader();
       // Copy the buffer: STLLoader.parse reads it as-is and we don't want
@@ -95,34 +102,42 @@ function useStageGeometry(
       // that runs, and works just as well when flipping through stages.
       if (!geometry.hasColors) {
         applyProceduralDentalColors(geometry, { toothColor, gumColor });
-        setCache((prev) => new Map(prev).set(key, { geometry, error: null, mlStatus: "running" }));
-
-        segmentToothGum(geometry, jaw)
-          .then((labels) => {
-            setToothGumColors(geometry, labels, toothColor, gumColor);
-            geometry.attributes.color.needsUpdate = true;
-            setCache((prev) => new Map(prev).set(key, { geometry, error: null, mlStatus: "done" }));
-          })
-          .catch((mlError) => {
-            console.error("Segmentation MeshSegNet indisponible :", mlError);
-            setCache((prev) => new Map(prev).set(key, { geometry, error: null, mlStatus: "unavailable" }));
-          });
+        cacheRef.current.set(key, { geometry, error: null, mlStatus: "running" });
       } else {
-        setCache((prev) => new Map(prev).set(key, { geometry, error: null, mlStatus: "unavailable" }));
+        cacheRef.current.set(key, { geometry, error: null, mlStatus: "unavailable" });
       }
     } catch (error) {
       console.error("Erreur de lecture du fichier STL :", error);
-      setCache((prev) =>
-        new Map(prev).set(key, {
-          geometry: null,
-          error: "Impossible de lire ce fichier STL.",
-          mlStatus: "idle",
-        })
-      );
+      cacheRef.current.set(key, {
+        geometry: null,
+        error: "Impossible de lire ce fichier STL.",
+        mlStatus: "idle",
+      });
     }
-  }, [key, buffer, jaw, toothColor, gumColor]);
+  }
 
-  return cache.get(key) ?? { geometry: null, error: null, mlStatus: buffer ? "running" : "idle" };
+  useEffect(() => {
+    const entry = cacheRef.current.get(key);
+    if (!entry || !entry.geometry || entry.mlStatus !== "running") return;
+    if (startedRef.current.has(key)) return; // already segmenting or done
+    startedRef.current.add(key);
+    const geometry = entry.geometry;
+
+    segmentToothGum(geometry, jaw)
+      .then((labels) => {
+        setToothGumColors(geometry, labels, toothColor, gumColor);
+        geometry.attributes.color.needsUpdate = true;
+        cacheRef.current.set(key, { geometry, error: null, mlStatus: "done" });
+        setTick((t) => t + 1);
+      })
+      .catch((mlError) => {
+        console.error("Segmentation MeshSegNet indisponible :", mlError);
+        cacheRef.current.set(key, { geometry, error: null, mlStatus: "unavailable" });
+        setTick((t) => t + 1);
+      });
+  }, [key, jaw, toothColor, gumColor]);
+
+  return cacheRef.current.get(key) ?? { geometry: null, error: null, mlStatus: buffer ? "running" : "idle" };
 }
 
 // Enamel-like material: low metalness, a soft clearcoat for the moist/glossy
@@ -202,6 +217,27 @@ export default function STLViewer({ stages }: Viewer3DProps) {
   const hasAny = hasUpper || hasLower;
   const mlRunning = upper.mlStatus === "running" || lower.mlStatus === "running";
   const hasMultipleStages = stages.length > 1;
+
+  // <Stage>'s adjustCamera re-fits/re-centers the camera on the bounding box
+  // of whatever's currently displayed. That's the right behaviour the first
+  // time a model appears (or when toggling which arch is shown), but
+  // clear-aligner movement between stages is only a millimeter or two on a
+  // several-centimeter arch — refitting the camera on every stage switch
+  // recenters/rescales the view to compensate, which visually cancels out
+  // that movement instead of letting the practitioner see it. Only allow a
+  // refit once per "reason to refit" (first load, or an arch visibility
+  // change), not on every stageIndex change.
+  const [fitToken, setFitToken] = useState(0);
+  const prevVisibilityRef = useRef(visibility);
+  useEffect(() => {
+    if (prevVisibilityRef.current !== visibility) {
+      prevVisibilityRef.current = visibility;
+      setFitToken((t) => t + 1);
+    }
+  }, [visibility]);
+  const fittedTokenRef = useRef(-1);
+  const shouldAdjustCamera = hasAny && fittedTokenRef.current !== fitToken;
+  if (shouldAdjustCamera) fittedTokenRef.current = fitToken;
 
   useEffect(() => {
     return () => {
@@ -471,7 +507,7 @@ export default function STLViewer({ stages }: Viewer3DProps) {
               environment={null}
               intensity={0.5}
               shadows={{ type: "contact", opacity: 0.5, blur: 2.5, size: 2048 }}
-              adjustCamera={1.3}
+              adjustCamera={shouldAdjustCamera ? 1.3 : false}
             >
               {(visibility === "both" || visibility === "upper") &&
                 upper.geometry && (
