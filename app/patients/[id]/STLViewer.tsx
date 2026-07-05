@@ -7,7 +7,7 @@ import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 import { applyProceduralDentalColors } from "./dentalColoring";
-import { segmentToothGum, type Jaw } from "./meshsegnet/segment";
+import { segmentReferenceStage, classifyStageWithProfile, type Jaw } from "./meshsegnet/segment";
 
 export type ArchVisibility = "both" | "upper" | "lower";
 
@@ -52,98 +52,135 @@ function setToothGumColors(
   geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
 }
 
-// Per-stage, per-jaw geometry cache. Each stage's STL is only ever parsed
-// and segmented once: switching stages (manually, via autoplay, or during
-// video export) reuses whatever's already in the cache instead of
-// reprocessing, and a segmentation that finishes after the user has moved
-// on to another stage still lands in its own cache entry — so coming back
-// later shows the AI-refined result immediately rather than redoing it.
+interface AllStagesGeometry {
+  states: Map<number, GeometryState>;
+  processedCount: number;
+  totalCount: number;
+}
+
+// Parses and colors *every* stage's jaw mesh once, eagerly, as soon as
+// `stages` is available — not lazily on first visit — so Précédent/Suivant
+// navigation is just reading an already-populated cache, never triggering
+// any parsing or computation itself.
 //
-// The STL parse + procedural coloring happen synchronously during render
-// (memoized into `cacheRef`, keyed by stage+jaw, so each buffer is only
-// ever parsed once) rather than inside a useEffect. Doing it in an effect
-// meant that on every stage switch there was a render where the new key
-// wasn't in the cache yet — `geometry` was briefly null, `hasAny` false,
-// and the whole model (or even the whole Canvas, since it's only mounted
-// when `hasAny`) flashed away to the "Aucun modèle 3D importé" placeholder
-// before the effect caught up a moment later. Only the actual MeshSegNet
-// segmentation (genuinely async, ~10s) stays in an effect.
-function useStageGeometry(
+// Only one stage (the first one with a usable mesh — the "reference")
+// actually runs the full MeshSegNet pipeline. Real ClearAligner treatment
+// only moves teeth; the gum tissue barely shifts stage to stage. Running
+// independent ML segmentation per stage let ordinary model noise/variance
+// draw the tooth/gum boundary a little differently each time, which read
+// as the gum sliding around between stages even though nothing there
+// actually changed. So the reference's result is turned into a reusable
+// boundary profile (see meshsegnet/gumProfile.ts) and every other stage is
+// classified against that exact same profile — cheap (no ONNX, no
+// decimation), and because the criterion is identical everywhere, the
+// boundary reads as stable while the teeth move, the way dedicated
+// orthodontic software (3Shape/ClinCheck) renders a staging animation.
+function useAllStagesGeometry(
   stages: ScanStageInput[],
-  stageIndex: number,
   jaw: Jaw,
   toothColor: string,
   gumColor: string
-): GeometryState {
-  const cacheRef = useRef<Map<string, GeometryState>>(new Map());
-  const startedRef = useRef<Set<string>>(new Set());
+): AllStagesGeometry {
+  const cacheRef = useRef<Map<number, GeometryState>>(new Map());
+  const processedRef = useRef(0);
   const [, setTick] = useState(0);
-  const key = `${jaw}-${stageIndex}`;
-  const stage = stages[stageIndex];
-  const buffer = stage ? (jaw === "upper" ? stage.upperBuffer : stage.lowerBuffer) : null;
-
-  if (buffer && !cacheRef.current.has(key)) {
-    try {
-      const loader = new STLLoader();
-      // Copy the buffer: STLLoader.parse reads it as-is and we don't want
-      // downstream consumers of the original ArrayBuffer to be affected.
-      const geometry = loader.parse(buffer.slice(0)) as THREE.BufferGeometry & {
-        hasColors?: boolean;
-      };
-      geometry.computeVertexNormals();
-      // Plain 3Shape STL exports carry no color at all. The one exception
-      // is the "Magics" binary STL color extension, which STLLoader already
-      // decodes into a real per-facet "color" attribute (geometry.hasColors)
-      // — when present, that's real scan color and takes priority over any
-      // guesswork. Otherwise, show an immediate procedural ivory/gum
-      // estimate, then refine it in the background with the MeshSegNet ONNX
-      // model (real tooth/gingiva segmentation, ~10s client-side) once it's
-      // ready — the procedural pass means the viewer never sits blank while
-      // that runs, and works just as well when flipping through stages.
-      if (!geometry.hasColors) {
-        applyProceduralDentalColors(geometry, { toothColor, gumColor });
-        cacheRef.current.set(key, { geometry, error: null, mlStatus: "running" });
-      } else {
-        cacheRef.current.set(key, { geometry, error: null, mlStatus: "unavailable" });
-      }
-    } catch (error) {
-      console.error("Erreur de lecture du fichier STL :", error);
-      cacheRef.current.set(key, {
-        geometry: null,
-        error: "Impossible de lire ce fichier STL.",
-        mlStatus: "idle",
-      });
-    }
-  }
 
   useEffect(() => {
-    const entry = cacheRef.current.get(key);
-    if (!entry || !entry.geometry || entry.mlStatus !== "running") return;
-    if (startedRef.current.has(key)) return; // already segmenting or done
-    startedRef.current.add(key);
-    const geometry = entry.geometry;
+    if (stages.length === 0) return;
+    let cancelled = false;
+    // A fresh cache per effect run (not a "have we already done this"
+    // guard): React 19's Strict Mode runs this effect, its cleanup, then
+    // the effect again on mount in dev, and a boolean guard set before the
+    // first `await` would make the *second* (the one that actually stays
+    // mounted) invocation see "already handled" and skip forever. Starting
+    // clean each time and only using `cancelled` to drop a stale run's
+    // results is what actually works with that double-invoke.
+    const cache = new Map<number, GeometryState>();
+    cacheRef.current = cache;
+    processedRef.current = 0;
 
-    segmentToothGum(geometry, jaw)
-      .then((labels) => {
-        setToothGumColors(geometry, labels, toothColor, gumColor);
-        geometry.attributes.color.needsUpdate = true;
-        cacheRef.current.set(key, { geometry, error: null, mlStatus: "done" });
+    (async () => {
+      // Parse every stage up front and show an instant procedural ivory/
+      // gum estimate for each, so nothing sits blank while the reference
+      // segmentation (and then the fast per-stage classification) runs.
+      for (let i = 0; i < stages.length; i++) {
+        const buffer = jaw === "upper" ? stages[i].upperBuffer : stages[i].lowerBuffer;
+        if (!buffer) continue;
+        try {
+          const loader = new STLLoader();
+          // Copy the buffer: STLLoader.parse reads it as-is and we don't
+          // want downstream consumers of the original ArrayBuffer affected.
+          const geometry = loader.parse(buffer.slice(0)) as THREE.BufferGeometry & {
+            hasColors?: boolean;
+          };
+          geometry.computeVertexNormals();
+          // Plain 3Shape STL exports carry no color at all. The one
+          // exception is the "Magics" binary STL color extension, which
+          // STLLoader already decodes into a real per-facet "color"
+          // attribute (geometry.hasColors) — when present, that's real
+          // scan color and takes priority over any guesswork.
+          if (!geometry.hasColors) {
+            applyProceduralDentalColors(geometry, { toothColor, gumColor });
+            cache.set(i, { geometry, error: null, mlStatus: "running" });
+          } else {
+            cache.set(i, { geometry, error: null, mlStatus: "unavailable" });
+            processedRef.current += 1;
+          }
+        } catch (error) {
+          console.error("Erreur de lecture du fichier STL :", error);
+          cache.set(i, {
+            geometry: null,
+            error: "Impossible de lire ce fichier STL.",
+            mlStatus: "idle",
+          });
+        }
+      }
+      if (cancelled) return;
+      setTick((t) => t + 1);
+
+      const referenceIndex = Array.from(cache.entries()).find(
+        ([, entry]) => entry.geometry && entry.mlStatus === "running"
+      )?.[0];
+      if (referenceIndex === undefined) return; // nothing needs ML (all real-color or unreadable)
+      const referenceGeometry = cache.get(referenceIndex)!.geometry!;
+
+      try {
+        const { labels, profile } = await segmentReferenceStage(referenceGeometry, jaw);
+        if (cancelled) return;
+        setToothGumColors(referenceGeometry, labels, toothColor, gumColor);
+        referenceGeometry.attributes.color.needsUpdate = true;
+        cache.set(referenceIndex, { geometry: referenceGeometry, error: null, mlStatus: "done" });
+        processedRef.current += 1;
         setTick((t) => t + 1);
-      })
-      .catch((mlError) => {
+
+        for (let i = 0; i < stages.length; i++) {
+          if (cancelled) return;
+          if (i === referenceIndex) continue;
+          const entry = cache.get(i);
+          if (!entry?.geometry || entry.mlStatus !== "running") continue;
+          const labelsI = classifyStageWithProfile(entry.geometry, profile);
+          setToothGumColors(entry.geometry, labelsI, toothColor, gumColor);
+          entry.geometry.attributes.color.needsUpdate = true;
+          cache.set(i, { geometry: entry.geometry, error: null, mlStatus: "done" });
+          processedRef.current += 1;
+          setTick((t) => t + 1);
+        }
+      } catch (mlError) {
         console.error("Segmentation MeshSegNet indisponible :", mlError);
-        cacheRef.current.set(key, { geometry, error: null, mlStatus: "unavailable" });
+        if (cancelled) return;
+        for (const [i, entry] of cache.entries()) {
+          if (entry.mlStatus === "running") cache.set(i, { ...entry, mlStatus: "unavailable" });
+        }
         setTick((t) => t + 1);
-      });
-    // `buffer` is what actually flips from null to a real ArrayBuffer once
-    // `stages` finishes loading asynchronously from IndexedDB — `key` alone
-    // (jaw + stageIndex) stays the same across that transition, so it must
-    // be a dependency here or this effect fires once too early (while
-    // buffer is still null, cache entry doesn't exist yet) and never again,
-    // silently leaving segmentation stuck at "running" forever.
-  }, [key, buffer, jaw, toothColor, gumColor]);
+      }
+    })();
 
-  return cacheRef.current.get(key) ?? { geometry: null, error: null, mlStatus: buffer ? "running" : "idle" };
+    return () => {
+      cancelled = true;
+    };
+  }, [stages, jaw, toothColor, gumColor]);
+
+  return { states: cacheRef.current, processedCount: processedRef.current, totalCount: stages.length };
 }
 
 // Enamel-like material: low metalness, a soft clearcoat for the moist/glossy
@@ -159,8 +196,8 @@ function JawMesh({
   fallbackColor: string;
 }) {
   // Vertex colors carry the tooth/gum split (either real scan color or the
-  // procedural ivory/gum estimate computed in useStageGeometry). The
-  // material color is left white so it doesn't tint them; fallbackColor
+  // procedural/AI-classified estimate computed in useAllStagesGeometry).
+  // The material color is left white so it doesn't tint them; fallbackColor
   // only kicks in for the unexpected case where no color attribute made it
   // through.
   const hasVertexColors = geometry.hasAttribute("color");
@@ -207,8 +244,14 @@ export default function STLViewer({ stages }: Viewer3DProps) {
   }, [stages.length]);
 
   const currentStage = stages[stageIndex] as ScanStageInput | undefined;
-  const upper = useStageGeometry(stages, stageIndex, "upper", UPPER_TOOTH_COLOR, UPPER_GUM_COLOR);
-  const lower = useStageGeometry(stages, stageIndex, "lower", LOWER_TOOTH_COLOR, LOWER_GUM_COLOR);
+  const upperAll = useAllStagesGeometry(stages, "upper", UPPER_TOOTH_COLOR, UPPER_GUM_COLOR);
+  const lowerAll = useAllStagesGeometry(stages, "lower", LOWER_TOOTH_COLOR, LOWER_GUM_COLOR);
+  const idleGeometry: GeometryState = { geometry: null, error: null, mlStatus: "idle" };
+  const upper = upperAll.states.get(stageIndex) ?? idleGeometry;
+  const lower = lowerAll.states.get(stageIndex) ?? idleGeometry;
+  const preparedCount = upperAll.processedCount + lowerAll.processedCount;
+  const totalToPrepare = upperAll.totalCount + lowerAll.totalCount;
+  const isPreparing = totalToPrepare > 0 && preparedCount < totalToPrepare;
 
   const [visibility, setVisibility] = useState<ArchVisibility>("both");
   const [autoRotate, setAutoRotate] = useState(false);
@@ -221,7 +264,6 @@ export default function STLViewer({ stages }: Viewer3DProps) {
   const hasUpper = upper.geometry !== null;
   const hasLower = lower.geometry !== null;
   const hasAny = hasUpper || hasLower;
-  const mlRunning = upper.mlStatus === "running" || lower.mlStatus === "running";
   const hasMultipleStages = stages.length > 1;
 
   // <Stage>'s adjustCamera re-fits/re-centers the camera on the bounding box
@@ -404,10 +446,12 @@ export default function STLViewer({ stages }: Viewer3DProps) {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          {mlRunning && (
+          {isPreparing && (
             <span className="flex items-center gap-1.5 rounded-full bg-blue-50 px-3 py-1.5 text-xs font-medium text-blue-600">
               <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500" />
-              Segmentation IA des dents/gencives…
+              {hasMultipleStages
+                ? `Préparation des étapes (${preparedCount}/${totalToPrepare})…`
+                : "Segmentation IA des dents/gencives…"}
             </span>
           )}
           <button

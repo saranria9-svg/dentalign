@@ -8,6 +8,11 @@
 // CDN) so this keeps working without an internet connection, matching this
 // app's existing "no CDN dependency" requirement (see STLViewer.tsx's
 // comment on why Stage's environment map is disabled).
+//
+// Only ONE stage per jaw (the reference — see STLViewer.tsx) ever runs
+// this full pipeline. Every other stage reuses the tooth/gum boundary it
+// learns via classifyStageWithProfile() below instead of re-segmenting
+// independently — see gumProfile.ts for why.
 
 import * as THREE from "three";
 import type * as OrtNamespace from "onnxruntime-web";
@@ -17,8 +22,10 @@ import { buildPairwiseEdges } from "./edges";
 import { binaryGraphCut } from "./graphcut";
 import { upsampleLabelsToFullRes } from "./upsample";
 import { computeToothnessPrior } from "./geometricPrior";
+import { calibrateGumProfile, classifyByGumProfile, type GumProfile } from "./gumProfile";
 
 export type Jaw = "upper" | "lower";
+export type { GumProfile } from "./gumProfile";
 
 const NUM_CLASSES = 15;
 const TARGET_CELLS = 10000;
@@ -77,16 +84,19 @@ export interface SegmentProgress {
   stage: "decimating" | "preprocessing" | "inferring" | "refining" | "upsampling" | "done";
 }
 
+export interface ReferenceSegmentResult {
+  /** Full-resolution tooth(1)/gingiva(0) labels for the reference stage. */
+  labels: Uint8Array;
+  /** Boundary learned from this stage, reusable on every other stage. */
+  profile: GumProfile;
+}
+
 // Decimation, feature/adjacency building, graph-cut and upsampling below
 // are plain synchronous JS on the main thread (only the ONNX `session.run`
-// call actually benefits from being async/threaded). Multiple stages can
-// each request a segmentation in quick succession — e.g. flipping through
-// Subsetup stages during autoplay faster than a single ~10s segmentation
-// finishes — and letting those run "concurrently" just interleaves their
-// synchronous chunks on the same thread, starving the UI (autoplay's stage
-// timer included) without actually finishing any of them sooner. A simple
-// FIFO queue serializes the heavy work: still fully async/non-blocking for
-// callers, just one stage's segmentation actually runs at a time.
+// call actually benefits from being async/threaded). Only one segmentation
+// (the reference stage, per jaw) ever runs, but upper and lower still run
+// this concurrently by default — a FIFO queue serializes them so they
+// don't thrash the main thread competing for CPU at the same time.
 let queue: Promise<void> = Promise.resolve();
 
 function runQueued<T>(task: () => Promise<T>): Promise<T> {
@@ -99,22 +109,24 @@ function runQueued<T>(task: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Segments a full-resolution jaw mesh into tooth (1) / gingiva (0) labels
- * per cell, aligned with `fullGeometry`'s (non-indexed) triangle order.
+ * Runs the full MeshSegNet pipeline on the reference stage's jaw mesh and
+ * learns a reusable tooth/gum boundary profile from its result (see
+ * gumProfile.ts). Every other stage should use classifyStageWithProfile()
+ * instead of calling this again.
  */
-export function segmentToothGum(
+export function segmentReferenceStage(
   fullGeometry: THREE.BufferGeometry,
   jaw: Jaw,
   onProgress?: (p: SegmentProgress) => void
-): Promise<Uint8Array> {
-  return runQueued(() => segmentToothGumImpl(fullGeometry, jaw, onProgress));
+): Promise<ReferenceSegmentResult> {
+  return runQueued(() => segmentReferenceStageImpl(fullGeometry, jaw, onProgress));
 }
 
-async function segmentToothGumImpl(
+async function segmentReferenceStageImpl(
   fullGeometry: THREE.BufferGeometry,
   jaw: Jaw,
   onProgress?: (p: SegmentProgress) => void
-): Promise<Uint8Array> {
+): Promise<ReferenceSegmentResult> {
   onProgress?.({ stage: "decimating" });
   const decGeometry = decimateToTargetCells(fullGeometry, TARGET_CELLS);
 
@@ -154,7 +166,8 @@ async function segmentToothGumImpl(
   // the labial/incisal side of anterior teeth, where the network's own
   // signal is weakest. A confident prediction's cost gap is much larger
   // than PRIOR_WEIGHT, so it's untouched by this; only near-tossup cells
-  // move.
+  // move. This matters even more now that this one run calibrates every
+  // other stage's boundary too.
   const PRIOR_WEIGHT = 80;
   const toothness = computeToothnessPrior(bx, by, bz, normalZ);
   for (let i = 0; i < nCells; i++) {
@@ -166,22 +179,42 @@ async function segmentToothGumImpl(
     decGeometry.attributes.position, 30, roundFactor
   );
   const refinedLabels = binaryGraphCut(nCells, unary0, unary1, edges);
+  const profile = calibrateGumProfile(bx, by, bz, refinedLabels);
 
   onProgress?.({ stage: "upsampling" });
-  const fullPos = fullGeometry.attributes.position;
-  const nFull = fullPos.count / 3;
-  const fbx = new Float64Array(nFull), fby = new Float64Array(nFull), fbz = new Float64Array(nFull);
-  let fcx = 0, fcy = 0, fcz = 0;
-  for (let i = 0; i < fullPos.count; i++) { fcx += fullPos.getX(i); fcy += fullPos.getY(i); fcz += fullPos.getZ(i); }
-  fcx /= fullPos.count; fcy /= fullPos.count; fcz /= fullPos.count;
-  for (let t = 0; t < nFull; t++) {
-    const i0 = t * 3, i1 = i0 + 1, i2 = i0 + 2;
-    fbx[t] = (fullPos.getX(i0) + fullPos.getX(i1) + fullPos.getX(i2)) / 3 - fcx;
-    fby[t] = (fullPos.getY(i0) + fullPos.getY(i1) + fullPos.getY(i2)) / 3 - fcy;
-    fbz[t] = (fullPos.getZ(i0) + fullPos.getZ(i1) + fullPos.getZ(i2)) / 3 - fcz;
-  }
-  const fullLabels = upsampleLabelsToFullRes(bx, by, bz, refinedLabels, fbx, fby, fbz, 3);
+  const { bx: fbx, by: fby, bz: fbz } = fullResCellBarycenters(fullGeometry);
+  const labels = upsampleLabelsToFullRes(bx, by, bz, refinedLabels, fbx, fby, fbz, 3);
 
   onProgress?.({ stage: "done" });
-  return fullLabels;
+  return { labels, profile };
+}
+
+/**
+ * Classifies every other stage's full-resolution mesh by re-applying the
+ * profile learned from the reference stage — no ONNX inference, no
+ * decimation, no graph-cut, just a per-cell height check, so it's cheap
+ * enough to run on every stage at import time and keeps the exact same
+ * boundary criterion (hence the same visual boundary) everywhere.
+ */
+export function classifyStageWithProfile(
+  fullGeometry: THREE.BufferGeometry,
+  profile: GumProfile
+): Uint8Array {
+  const { bx, by, bz } = fullResCellBarycenters(fullGeometry);
+  return classifyByGumProfile(bx, by, bz, profile);
+}
+
+function fullResCellBarycenters(fullGeometry: THREE.BufferGeometry) {
+  const fullPos = fullGeometry.attributes.position;
+  const nFull = fullPos.count / 3;
+  const bx = new Float64Array(nFull);
+  const by = new Float64Array(nFull);
+  const bz = new Float64Array(nFull);
+  for (let t = 0; t < nFull; t++) {
+    const i0 = t * 3, i1 = i0 + 1, i2 = i0 + 2;
+    bx[t] = (fullPos.getX(i0) + fullPos.getX(i1) + fullPos.getX(i2)) / 3;
+    by[t] = (fullPos.getY(i0) + fullPos.getY(i1) + fullPos.getY(i2)) / 3;
+    bz[t] = (fullPos.getZ(i0) + fullPos.getZ(i1) + fullPos.getZ(i2)) / 3;
+  }
+  return { bx, by, bz };
 }
