@@ -28,7 +28,16 @@ export type Jaw = "upper" | "lower";
 export type { ReferenceProfile } from "./gumProfile";
 
 const NUM_CLASSES = 15;
-const TARGET_CELLS = 10000;
+// 10,000 (matching the official reference pipeline's usual scale) visibly
+// under-resolved molar occlusal surfaces: the grid-based decimation (see
+// decimate.ts — deliberately simple/uniform, not feature-preserving quadric
+// decimation) collapses a fissure between two cusps into too few cells to
+// tell it apart from a real cervical margin, which read as gingiva bleeding
+// onto molar crowns. 15,000 gives ~50% more cells everywhere, including
+// posterior teeth, at a proportionally higher one-time reference-stage
+// inference cost — confirmed on two real, distinct patients to noticeably
+// clean up molar boundaries without touching the pipeline's structure.
+const TARGET_CELLS = 15000;
 const MODEL_URLS: Record<Jaw, string> = {
   upper: "/models/meshsegnet_upper.onnx",
   lower: "/models/meshsegnet_lower.onnx",
