@@ -135,7 +135,13 @@ function useStageGeometry(
         cacheRef.current.set(key, { geometry, error: null, mlStatus: "unavailable" });
         setTick((t) => t + 1);
       });
-  }, [key, jaw, toothColor, gumColor]);
+    // `buffer` is what actually flips from null to a real ArrayBuffer once
+    // `stages` finishes loading asynchronously from IndexedDB — `key` alone
+    // (jaw + stageIndex) stays the same across that transition, so it must
+    // be a dependency here or this effect fires once too early (while
+    // buffer is still null, cache entry doesn't exist yet) and never again,
+    // silently leaving segmentation stuck at "running" forever.
+  }, [key, buffer, jaw, toothColor, gumColor]);
 
   return cacheRef.current.get(key) ?? { geometry: null, error: null, mlStatus: buffer ? "running" : "idle" };
 }

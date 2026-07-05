@@ -16,6 +16,7 @@ import { buildFeaturesAndAdjacency } from "./preprocess";
 import { buildPairwiseEdges } from "./edges";
 import { binaryGraphCut } from "./graphcut";
 import { upsampleLabelsToFullRes } from "./upsample";
+import { computeToothnessPrior } from "./geometricPrior";
 
 export type Jaw = "upper" | "lower";
 
@@ -147,6 +148,18 @@ async function segmentToothGumImpl(
     pTooth = Math.max(pTooth, 1e-6);
     unary0[i] = -roundFactor * Math.log10(pGum);
     unary1[i] = -roundFactor * Math.log10(pTooth);
+  }
+  // Nudge ambiguous cells (weak ML confidence, unary0 ~= unary1) toward the
+  // geometrically expected label — mainly corrects gingiva bleeding onto
+  // the labial/incisal side of anterior teeth, where the network's own
+  // signal is weakest. A confident prediction's cost gap is much larger
+  // than PRIOR_WEIGHT, so it's untouched by this; only near-tossup cells
+  // move.
+  const PRIOR_WEIGHT = 80;
+  const toothness = computeToothnessPrior(bx, by, bz, normalZ);
+  for (let i = 0; i < nCells; i++) {
+    unary0[i] += toothness[i] * PRIOR_WEIGHT;
+    unary1[i] += (1 - toothness[i]) * PRIOR_WEIGHT;
   }
   const edges = buildPairwiseEdges(
     nCells, normalX, normalY, normalZ, bx, by, bz,
