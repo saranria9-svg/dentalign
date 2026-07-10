@@ -20,6 +20,8 @@ import { decimateToTargetCells } from "./decimate";
 import { buildFeaturesAndAdjacency } from "./preprocess";
 import { buildPairwiseEdges } from "./edges";
 import { binaryGraphCut } from "./graphcut";
+import { removeSmallLabelIslands } from "./islandCleanup";
+import { computeMarginLinePrediction } from "./marginLine";
 import { upsampleLabelsToFullRes } from "./upsample";
 import { computeToothnessPrior } from "./geometricPrior";
 import { calibrateGumProfile, classifyByGumProfile, type ReferenceProfile } from "./gumProfile";
@@ -183,11 +185,39 @@ async function segmentReferenceStageImpl(
     unary0[i] += toothness[i] * PRIOR_WEIGHT;
     unary1[i] += (1 - toothness[i]) * PRIOR_WEIGHT;
   }
+  // A second, far more informed prior: a single continuous margin-line
+  // height per angular wedge around the arch, median-filtered across
+  // wedges so a confidently-wrong ONNX run spanning 1-2 teeth (verified on
+  // a real molar — see marginLine.ts) can't anchor its own neighbourhood.
+  // Weighted higher than the geometric prior because, unlike a per-cell
+  // height heuristic, this one is already cross-referenced against the
+  // rest of the arch — it's the direct fix for "gingiva bleeding all the
+  // way up one molar's crown" that PRIOR_WEIGHT alone couldn't reach.
+  const MARGIN_LINE_WEIGHT = 150;
+  const marginLinePrediction = computeMarginLinePrediction(nCells, unary0, unary1, bx, by, bz);
+  for (let i = 0; i < nCells; i++) {
+    if (marginLinePrediction[i] === 1) unary0[i] += MARGIN_LINE_WEIGHT;
+    else unary1[i] += MARGIN_LINE_WEIGHT;
+  }
+  // Doubled from the paper's default of 30: at 30, a confident-but-wrong
+  // burst of unary cost could still carve a multi-cell gingiva patch across
+  // several premolar/central crowns (verified on real 3Shape data). 60 was
+  // enough to pull those back without over-smoothing; 100 was also tried
+  // and collapsed the whole arch to a single label (also verified live) —
+  // past a lambda_c/PRIOR_WEIGHT ratio, avoiding any boundary anywhere gets
+  // cheaper than respecting a real one, so 60 is the safe upper bound here.
   const edges = buildPairwiseEdges(
     nCells, normalX, normalY, normalZ, bx, by, bz,
-    decGeometry.attributes.position, 30, roundFactor
+    decGeometry.attributes.position, 60, roundFactor
   );
-  const refinedLabels = binaryGraphCut(nCells, unary0, unary1, edges);
+  const cutLabels = binaryGraphCut(nCells, unary0, unary1, edges);
+  // The graph-cut's smoothness term discourages small islands but doesn't
+  // forbid them — a confident-but-wrong burst of unary cost can still carve
+  // a small gingiva patch into a tooth crown, or vice versa. The tooth/gum
+  // boundary is one continuous curve around the arch, so a handful of
+  // isolated cells of the "wrong" label a few millimetres from that curve
+  // is never anatomically correct; snap them to their neighbourhood.
+  const refinedLabels = removeSmallLabelIslands(nCells, cutLabels, edges);
   const profile = calibrateGumProfile(bx, by, bz, refinedLabels);
 
   onProgress?.({ stage: "upsampling" });
