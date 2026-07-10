@@ -8,6 +8,11 @@
 // CDN) so this keeps working without an internet connection, matching this
 // app's existing "no CDN dependency" requirement (see STLViewer.tsx's
 // comment on why Stage's environment map is disabled).
+//
+// Only ONE stage per jaw (the reference — see STLViewer.tsx) ever runs
+// this full pipeline. Every other stage reuses the tooth/gum boundary it
+// learns via classifyStageWithProfile() below instead of re-segmenting
+// independently — see gumProfile.ts for why.
 
 import * as THREE from "three";
 import type * as OrtNamespace from "onnxruntime-web";
@@ -15,12 +20,26 @@ import { decimateToTargetCells } from "./decimate";
 import { buildFeaturesAndAdjacency } from "./preprocess";
 import { buildPairwiseEdges } from "./edges";
 import { binaryGraphCut } from "./graphcut";
+import { removeSmallLabelIslands } from "./islandCleanup";
+import { computeMarginLinePrediction } from "./marginLine";
 import { upsampleLabelsToFullRes } from "./upsample";
+import { computeToothnessPrior } from "./geometricPrior";
+import { calibrateGumProfile, classifyByGumProfile, type ReferenceProfile } from "./gumProfile";
 
 export type Jaw = "upper" | "lower";
+export type { ReferenceProfile } from "./gumProfile";
 
 const NUM_CLASSES = 15;
-const TARGET_CELLS = 10000;
+// 10,000 (matching the official reference pipeline's usual scale) visibly
+// under-resolved molar occlusal surfaces: the grid-based decimation (see
+// decimate.ts — deliberately simple/uniform, not feature-preserving quadric
+// decimation) collapses a fissure between two cusps into too few cells to
+// tell it apart from a real cervical margin, which read as gingiva bleeding
+// onto molar crowns. 15,000 gives ~50% more cells everywhere, including
+// posterior teeth, at a proportionally higher one-time reference-stage
+// inference cost — confirmed on two real, distinct patients to noticeably
+// clean up molar boundaries without touching the pipeline's structure.
+const TARGET_CELLS = 15000;
 const MODEL_URLS: Record<Jaw, string> = {
   upper: "/models/meshsegnet_upper.onnx",
   lower: "/models/meshsegnet_lower.onnx",
@@ -76,16 +95,19 @@ export interface SegmentProgress {
   stage: "decimating" | "preprocessing" | "inferring" | "refining" | "upsampling" | "done";
 }
 
+export interface ReferenceSegmentResult {
+  /** Full-resolution tooth(1)/gingiva(0) labels for the reference stage. */
+  labels: Uint8Array;
+  /** Boundary learned from this stage, reusable on every other stage. */
+  profile: ReferenceProfile;
+}
+
 // Decimation, feature/adjacency building, graph-cut and upsampling below
 // are plain synchronous JS on the main thread (only the ONNX `session.run`
-// call actually benefits from being async/threaded). Multiple stages can
-// each request a segmentation in quick succession — e.g. flipping through
-// Subsetup stages during autoplay faster than a single ~10s segmentation
-// finishes — and letting those run "concurrently" just interleaves their
-// synchronous chunks on the same thread, starving the UI (autoplay's stage
-// timer included) without actually finishing any of them sooner. A simple
-// FIFO queue serializes the heavy work: still fully async/non-blocking for
-// callers, just one stage's segmentation actually runs at a time.
+// call actually benefits from being async/threaded). Only one segmentation
+// (the reference stage, per jaw) ever runs, but upper and lower still run
+// this concurrently by default — a FIFO queue serializes them so they
+// don't thrash the main thread competing for CPU at the same time.
 let queue: Promise<void> = Promise.resolve();
 
 function runQueued<T>(task: () => Promise<T>): Promise<T> {
@@ -98,22 +120,24 @@ function runQueued<T>(task: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Segments a full-resolution jaw mesh into tooth (1) / gingiva (0) labels
- * per cell, aligned with `fullGeometry`'s (non-indexed) triangle order.
+ * Runs the full MeshSegNet pipeline on the reference stage's jaw mesh and
+ * learns a reusable tooth/gum boundary profile from its result (see
+ * gumProfile.ts). Every other stage should use classifyStageWithProfile()
+ * instead of calling this again.
  */
-export function segmentToothGum(
+export function segmentReferenceStage(
   fullGeometry: THREE.BufferGeometry,
   jaw: Jaw,
   onProgress?: (p: SegmentProgress) => void
-): Promise<Uint8Array> {
-  return runQueued(() => segmentToothGumImpl(fullGeometry, jaw, onProgress));
+): Promise<ReferenceSegmentResult> {
+  return runQueued(() => segmentReferenceStageImpl(fullGeometry, jaw, onProgress));
 }
 
-async function segmentToothGumImpl(
+async function segmentReferenceStageImpl(
   fullGeometry: THREE.BufferGeometry,
   jaw: Jaw,
   onProgress?: (p: SegmentProgress) => void
-): Promise<Uint8Array> {
+): Promise<ReferenceSegmentResult> {
   onProgress?.({ stage: "decimating" });
   const decGeometry = decimateToTargetCells(fullGeometry, TARGET_CELLS);
 
@@ -148,27 +172,112 @@ async function segmentToothGumImpl(
     unary0[i] = -roundFactor * Math.log10(pGum);
     unary1[i] = -roundFactor * Math.log10(pTooth);
   }
+  // Nudge ambiguous cells (weak ML confidence, unary0 ~= unary1) toward the
+  // geometrically expected label — mainly corrects gingiva bleeding onto
+  // the labial/incisal side of anterior teeth, where the network's own
+  // signal is weakest. A confident prediction's cost gap is much larger
+  // than PRIOR_WEIGHT, so it's untouched by this; only near-tossup cells
+  // move. This matters even more now that this one run calibrates every
+  // other stage's boundary too.
+  const PRIOR_WEIGHT = 80;
+  const toothness = computeToothnessPrior(bx, by, bz, normalZ);
+  for (let i = 0; i < nCells; i++) {
+    unary0[i] += toothness[i] * PRIOR_WEIGHT;
+    unary1[i] += (1 - toothness[i]) * PRIOR_WEIGHT;
+  }
+  // A second, far more informed prior: a single continuous margin-line
+  // height per angular wedge around the arch, median-filtered across
+  // wedges so a confidently-wrong ONNX run spanning 1-2 teeth (verified on
+  // a real molar — see marginLine.ts) can't anchor its own neighbourhood.
+  // Weighted higher than the geometric prior because, unlike a per-cell
+  // height heuristic, this one is already cross-referenced against the
+  // rest of the arch — it's the direct fix for "gingiva bleeding all the
+  // way up one molar's crown" that PRIOR_WEIGHT alone couldn't reach.
+  const MARGIN_LINE_WEIGHT = 150;
+  const marginLinePrediction = computeMarginLinePrediction(nCells, unary0, unary1, bx, by, bz);
+  for (let i = 0; i < nCells; i++) {
+    if (marginLinePrediction[i] === 1) unary0[i] += MARGIN_LINE_WEIGHT;
+    else unary1[i] += MARGIN_LINE_WEIGHT;
+  }
+  // Doubled from the paper's default of 30: at 30, a confident-but-wrong
+  // burst of unary cost could still carve a multi-cell gingiva patch across
+  // several premolar/central crowns (verified on real 3Shape data). 60 was
+  // enough to pull those back without over-smoothing; 100 was also tried
+  // and collapsed the whole arch to a single label (also verified live) —
+  // past a lambda_c/PRIOR_WEIGHT ratio, avoiding any boundary anywhere gets
+  // cheaper than respecting a real one, so 60 is the safe upper bound here.
   const edges = buildPairwiseEdges(
     nCells, normalX, normalY, normalZ, bx, by, bz,
-    decGeometry.attributes.position, 30, roundFactor
+    decGeometry.attributes.position, 60, roundFactor
   );
-  const refinedLabels = binaryGraphCut(nCells, unary0, unary1, edges);
+  const cutLabels = binaryGraphCut(nCells, unary0, unary1, edges);
+  // The graph-cut's smoothness term discourages small islands but doesn't
+  // forbid them — a confident-but-wrong burst of unary cost can still carve
+  // a small gingiva patch into a tooth crown, or vice versa. The tooth/gum
+  // boundary is one continuous curve around the arch, so a handful of
+  // isolated cells of the "wrong" label a few millimetres from that curve
+  // is never anatomically correct; snap them to their neighbourhood.
+  const refinedLabels = removeSmallLabelIslands(nCells, cutLabels, edges);
+  const profile = calibrateGumProfile(bx, by, bz, refinedLabels);
 
   onProgress?.({ stage: "upsampling" });
-  const fullPos = fullGeometry.attributes.position;
-  const nFull = fullPos.count / 3;
-  const fbx = new Float64Array(nFull), fby = new Float64Array(nFull), fbz = new Float64Array(nFull);
-  let fcx = 0, fcy = 0, fcz = 0;
-  for (let i = 0; i < fullPos.count; i++) { fcx += fullPos.getX(i); fcy += fullPos.getY(i); fcz += fullPos.getZ(i); }
-  fcx /= fullPos.count; fcy /= fullPos.count; fcz /= fullPos.count;
-  for (let t = 0; t < nFull; t++) {
-    const i0 = t * 3, i1 = i0 + 1, i2 = i0 + 2;
-    fbx[t] = (fullPos.getX(i0) + fullPos.getX(i1) + fullPos.getX(i2)) / 3 - fcx;
-    fby[t] = (fullPos.getY(i0) + fullPos.getY(i1) + fullPos.getY(i2)) / 3 - fcy;
-    fbz[t] = (fullPos.getZ(i0) + fullPos.getZ(i1) + fullPos.getZ(i2)) / 3 - fcz;
-  }
-  const fullLabels = upsampleLabelsToFullRes(bx, by, bz, refinedLabels, fbx, fby, fbz, 3);
+  const { bx: fbx, by: fby, bz: fbz } = fullResCellBarycenters(fullGeometry);
+  const labels = upsampleLabelsToFullRes(bx, by, bz, refinedLabels, fbx, fby, fbz, 3);
 
   onProgress?.({ stage: "done" });
-  return fullLabels;
+  return { labels, profile };
+}
+
+/**
+ * Classifies every other stage's mesh by re-applying the profile learned
+ * from the reference stage — no ONNX inference, no graph-cut, so it's
+ * cheap enough to run on every stage at import time while still tracking
+ * the reference's real (not just averaged) boundary shape.
+ *
+ * The K-NN vote runs against the *decimated* mesh (same ~10,000-cell scale
+ * as the reference profile itself), then propagates to full resolution via
+ * the same majority-vote upsampling the reference stage's own pipeline
+ * uses. Voting per full-resolution cell directly (~150k+ independent
+ * queries) looked speckled — each cell's own nearest neighbours can flip
+ * independently of its physical neighbours with no spatial smoothing,
+ * unlike the graph-cut's pairwise terms. Classifying only the decimated
+ * cells and upsampling gives each small patch of full-resolution triangles
+ * the same label as their shared decimated cell, which is what actually
+ * reads as a clean, solid boundary instead of noise.
+ */
+export function classifyStageWithProfile(
+  fullGeometry: THREE.BufferGeometry,
+  profile: ReferenceProfile
+): Uint8Array {
+  const decGeometry = decimateToTargetCells(fullGeometry, TARGET_CELLS);
+  const decPos = decGeometry.attributes.position;
+  const nDec = decPos.count / 3;
+  const dbx = new Float64Array(nDec);
+  const dby = new Float64Array(nDec);
+  const dbz = new Float64Array(nDec);
+  for (let t = 0; t < nDec; t++) {
+    const i0 = t * 3, i1 = i0 + 1, i2 = i0 + 2;
+    dbx[t] = (decPos.getX(i0) + decPos.getX(i1) + decPos.getX(i2)) / 3;
+    dby[t] = (decPos.getY(i0) + decPos.getY(i1) + decPos.getY(i2)) / 3;
+    dbz[t] = (decPos.getZ(i0) + decPos.getZ(i1) + decPos.getZ(i2)) / 3;
+  }
+  const decLabels = classifyByGumProfile(dbx, dby, dbz, profile);
+
+  const { bx: fbx, by: fby, bz: fbz } = fullResCellBarycenters(fullGeometry);
+  return upsampleLabelsToFullRes(dbx, dby, dbz, decLabels, fbx, fby, fbz, 3);
+}
+
+function fullResCellBarycenters(fullGeometry: THREE.BufferGeometry) {
+  const fullPos = fullGeometry.attributes.position;
+  const nFull = fullPos.count / 3;
+  const bx = new Float64Array(nFull);
+  const by = new Float64Array(nFull);
+  const bz = new Float64Array(nFull);
+  for (let t = 0; t < nFull; t++) {
+    const i0 = t * 3, i1 = i0 + 1, i2 = i0 + 2;
+    bx[t] = (fullPos.getX(i0) + fullPos.getX(i1) + fullPos.getX(i2)) / 3;
+    by[t] = (fullPos.getY(i0) + fullPos.getY(i1) + fullPos.getY(i2)) / 3;
+    bz[t] = (fullPos.getZ(i0) + fullPos.getZ(i1) + fullPos.getZ(i2)) / 3;
+  }
+  return { bx, by, bz };
 }
